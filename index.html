@@ -1,1 +1,586 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Score Check-in</title>
 
+<!--
+  PARTICIPANT APP
+  ----------------
+  Purpose: a group logs in with their PIN once, then can:
+    1. See their group's current total score
+    2. Log a boulder completion (self-report, fixed point value per boulder)
+  No editing/undo here on purpose — wrong entries get fixed via the
+  admin adjustment panel (separate app), which keeps an audit trail.
+
+  SETUP REQUIRED BEFORE THIS WORKS:
+    1. Create a Firebase project (console.firebase.google.com)
+    2. Enable Firestore
+    3. Fill in firebaseConfig below with your project's values
+    4. Seed a `config/boulders` doc and `config/outlets` doc (see bottom
+       of this file for the expected shape) — this app reads boulder
+       names/points from Firestore, not from hardcoded values here,
+       so you can add/change boulders without touching code.
+    5. Deploy Firestore security rules (see firestore.rules in this
+       project) — as shipped, this file assumes rules restrict writes
+       to authenticated group sessions only.
+-->
+
+<style>
+  :root {
+    /* Neutral palette before login — house color takes over after */
+    --stone-900: #2B2A27;
+    --stone-700: #514E48;
+    --stone-400: #8C887F;
+    --stone-200: #DAD6CC;
+    --chalk: #F1EEE5;
+    --accent: #6B6558; /* replaced by house color post-login */
+    --accent-contrast: #F1EEE5;
+    --danger: #B3402C;
+    --radius: 10px;
+    color-scheme: light;
+  }
+
+  * { box-sizing: border-box; }
+
+  html, body {
+    height: 100%;
+    margin: 0;
+    background: var(--chalk);
+    color: var(--stone-900);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    padding-top: env(safe-area-inset-top, 0px);
+    padding-bottom: env(safe-area-inset-bottom, 0px);
+  }
+
+  #app {
+    max-width: 480px;
+    margin: 0 auto;
+    min-height: 100%;
+    display: flex;
+    flex-direction: column;
+  }
+
+  header {
+    padding: 20px 20px 16px;
+    background: var(--accent);
+    color: var(--accent-contrast);
+    transition: background 0.3s ease;
+  }
+
+  header .house-name {
+    font-size: 13px;
+    letter-spacing: 0.02em;
+    opacity: 0.85;
+    margin: 0 0 2px;
+  }
+
+  header .group-name {
+    font-size: 22px;
+    font-weight: 700;
+    margin: 0;
+  }
+
+  header .score {
+    font-size: 42px;
+    font-weight: 800;
+    margin: 12px 0 0;
+    line-height: 1;
+  }
+
+  header .score-label {
+    font-size: 12px;
+    opacity: 0.8;
+    margin-top: 2px;
+  }
+
+  main {
+    flex: 1;
+    padding: 16px 16px 32px;
+  }
+
+  /* --- Login screen --- */
+  #login-screen {
+    padding: 40px 24px;
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+  }
+
+  #login-screen h1 {
+    font-size: 24px;
+    margin: 0 0 4px;
+  }
+
+  #login-screen p {
+    color: var(--stone-700);
+    margin: 0 0 12px;
+    font-size: 15px;
+  }
+
+  input[type="text"] {
+    font-size: 20px;
+    padding: 14px 16px;
+    border: 2px solid var(--stone-200);
+    border-radius: var(--radius);
+    text-align: center;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    width: 100%;
+  }
+
+  input[type="text"]:focus {
+    outline: 3px solid var(--stone-400);
+    outline-offset: 1px;
+  }
+
+  button {
+    font-size: 17px;
+    font-weight: 600;
+    padding: 16px;
+    border-radius: var(--radius);
+    border: none;
+    cursor: pointer;
+    width: 100%;
+  }
+
+  .btn-primary {
+    background: var(--stone-900);
+    color: var(--chalk);
+  }
+
+  .btn-primary:disabled {
+    background: var(--stone-400);
+    cursor: not-allowed;
+  }
+
+  .btn-primary:active { transform: scale(0.98); }
+
+  #login-error {
+    color: var(--danger);
+    font-size: 14px;
+    min-height: 18px;
+  }
+
+  /* --- Outlet tabs --- */
+  .outlet-tabs {
+    display: flex;
+    gap: 8px;
+    margin: 16px 0;
+    overflow-x: auto;
+  }
+
+  .outlet-tab {
+    flex: 1;
+    text-align: center;
+    padding: 10px 8px;
+    border-radius: var(--radius);
+    background: var(--stone-200);
+    font-size: 14px;
+    font-weight: 600;
+    cursor: pointer;
+    white-space: nowrap;
+  }
+
+  .outlet-tab.active {
+    background: var(--stone-900);
+    color: var(--chalk);
+  }
+
+  /* --- Boulder list --- */
+  .boulder-card {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    background: white;
+    border: 1px solid var(--stone-200);
+    border-radius: var(--radius);
+    padding: 14px 16px;
+    margin-bottom: 10px;
+  }
+
+  .boulder-card.done {
+    background: var(--stone-200);
+  }
+
+  .boulder-info .name {
+    font-weight: 600;
+    font-size: 16px;
+  }
+
+  .boulder-info .points {
+    font-size: 13px;
+    color: var(--stone-700);
+  }
+
+  .boulder-action {
+    font-size: 14px;
+    font-weight: 700;
+    padding: 10px 16px;
+    border-radius: 8px;
+    border: none;
+  }
+
+  .boulder-action.log {
+    background: var(--stone-900);
+    color: var(--chalk);
+  }
+
+  .boulder-action.logged {
+    background: transparent;
+    color: var(--stone-400);
+  }
+
+  #toast {
+    position: fixed;
+    bottom: calc(24px + env(safe-area-inset-bottom, 0px));
+    left: 50%;
+    transform: translateX(-50%) translateY(20px);
+    background: var(--stone-900);
+    color: var(--chalk);
+    padding: 12px 20px;
+    border-radius: 999px;
+    font-size: 14px;
+    font-weight: 600;
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 0.25s ease, transform 0.25s ease;
+    max-width: 90%;
+    text-align: center;
+  }
+
+  #toast.show {
+    opacity: 1;
+    transform: translateX(-50%) translateY(0);
+  }
+
+  .offline-banner {
+    display: none;
+    background: var(--danger);
+    color: white;
+    text-align: center;
+    font-size: 13px;
+    padding: 8px;
+  }
+
+  .offline-banner.show { display: block; }
+
+  .empty-state {
+    text-align: center;
+    color: var(--stone-700);
+    padding: 40px 20px;
+    font-size: 14px;
+  }
+
+  #shuttle-link {
+    display: block;
+    text-align: center;
+    margin-top: 24px;
+    color: var(--stone-700);
+    font-size: 13px;
+    text-decoration: underline;
+  }
+</style>
+</head>
+<body>
+
+<div id="app">
+  <div class="offline-banner" id="offline-banner">
+    No connection — your last saved data is shown. Completions won't log until you're back online.
+  </div>
+
+  <!-- LOGIN SCREEN -->
+  <div id="login-screen">
+    <h1>Group check-in</h1>
+    <p>Enter the PIN your group was given at signup.</p>
+    <input type="text" id="pin-input" placeholder="GROUP PIN" maxlength="8" autocomplete="off" autocapitalize="characters">
+    <div id="login-error"></div>
+    <button class="btn-primary" id="login-btn">Log in</button>
+  </div>
+
+  <!-- MAIN SCREEN (hidden until logged in) -->
+  <div id="main-screen" style="display:none;">
+    <header>
+      <p class="house-name" id="house-name">House</p>
+      <p class="group-name" id="group-name">Group</p>
+      <p class="score" id="group-score">0</p>
+      <p class="score-label">total points</p>
+    </header>
+
+    <main>
+      <div class="outlet-tabs" id="outlet-tabs"></div>
+      <div id="boulder-list"></div>
+      <a href="#" id="shuttle-link" target="_blank" rel="noopener">Shuttle bus schedule →</a>
+    </main>
+  </div>
+
+  <div id="toast"></div>
+</div>
+
+<script type="module">
+  import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js";
+  import {
+    getFirestore, doc, getDoc, setDoc, collection, addDoc,
+    query, where, onSnapshot, serverTimestamp, enableIndexedDbPersistence
+  } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
+
+  // ---- 1. FILL THIS IN with your Firebase project's config ----
+  const firebaseConfig = {
+    apiKey: "REPLACE_ME",
+    authDomain: "REPLACE_ME.firebaseapp.com",
+    projectId: "REPLACE_ME",
+    storageBucket: "REPLACE_ME.appspot.com",
+    messagingSenderId: "REPLACE_ME",
+    appId: "REPLACE_ME"
+  };
+
+  const app = initializeApp(firebaseConfig);
+  const db = getFirestore(app);
+
+  // Offline persistence: lets the app keep working (read cached data,
+  // queue writes) through brief wifi drops at outlets. Writes made
+  // offline sync automatically once connection returns.
+  enableIndexedDbPersistence(db).catch((err) => {
+    console.warn("Offline persistence not enabled:", err.code);
+  });
+
+  // ---- 2. Expected Firestore shape ----
+  // config/shuttleUrl        -> { url: "https://..." }
+  // outlets/{outletId}       -> { name: "Outlet A", order: 1 }
+  // boulders/{boulderId}     -> { outletId, name: "Problem 4", points: 10, order: 1 }
+  // groups/{groupId}         -> { pin, houseId, name, totalScore }
+  // houses/{houseId}         -> { name, color: "#RRGGBB" }
+  // boulderCompletions/{id}  -> { groupId, outletId, boulderId, points, timestamp }
+
+  let currentGroup = null;
+  let currentGroupId = null;
+  let currentHouse = null;
+  let boulders = [];
+  let outlets = [];
+  let completedBoulderIds = new Set();
+  let activeOutletId = null;
+
+  const $ = (id) => document.getElementById(id);
+
+  function showToast(msg) {
+    const t = $("toast");
+    t.textContent = msg;
+    t.classList.add("show");
+    setTimeout(() => t.classList.remove("show"), 2200);
+  }
+
+  window.addEventListener("online", () => $("offline-banner").classList.remove("show"));
+  window.addEventListener("offline", () => $("offline-banner").classList.add("show"));
+
+  // ---- Login ----
+  $("login-btn").addEventListener("click", handleLogin);
+  $("pin-input").addEventListener("keydown", (e) => { if (e.key === "Enter") handleLogin(); });
+
+  async function handleLogin() {
+    const pin = $("pin-input").value.trim().toUpperCase();
+    const errEl = $("login-error");
+    errEl.textContent = "";
+
+    if (!pin) { errEl.textContent = "Enter a PIN."; return; }
+
+    $("login-btn").disabled = true;
+    $("login-btn").textContent = "Checking...";
+
+    try {
+      // Groups are keyed by PIN for lookup. In practice, seed the
+      // `groups` collection so groupId == pin, or maintain a
+      // `pinIndex/{pin} -> groupId` lookup doc if you want PINs
+      // separate from doc IDs.
+      const groupRef = doc(db, "groups", pin);
+      const groupSnap = await getDoc(groupRef);
+
+      if (!groupSnap.exists()) {
+        errEl.textContent = "PIN not recognized. Check with a game master.";
+        return;
+      }
+
+      currentGroupId = pin;
+      currentGroup = groupSnap.data();
+
+      const houseRef = doc(db, "houses", currentGroup.houseId);
+      const houseSnap = await getDoc(houseRef);
+      currentHouse = houseSnap.exists() ? houseSnap.data() : { name: "House", color: "#6B6558" };
+
+      localStorage.setItem("groupPin", pin); // convenience only — not auth, just avoids retyping
+      enterMainScreen();
+    } catch (e) {
+      console.error(e);
+      errEl.textContent = "Something went wrong. Try again.";
+    } finally {
+      $("login-btn").disabled = false;
+      $("login-btn").textContent = "Log in";
+    }
+  }
+
+  function enterMainScreen() {
+    $("login-screen").style.display = "none";
+    $("main-screen").style.display = "block";
+
+    document.documentElement.style.setProperty("--accent", currentHouse.color || "#6B6558");
+    $("house-name").textContent = currentHouse.name || "";
+    $("group-name").textContent = currentGroup.name || currentGroupId;
+
+    listenToGroupScore();
+    loadOutletsAndBoulders();
+    loadShuttleLink();
+  }
+
+  function listenToGroupScore() {
+    const groupRef = doc(db, "groups", currentGroupId);
+    onSnapshot(groupRef, (snap) => {
+      if (snap.exists()) {
+        $("group-score").textContent = snap.data().totalScore ?? 0;
+      }
+    });
+  }
+
+  async function loadShuttleLink() {
+    try {
+      const snap = await getDoc(doc(db, "config", "shuttleUrl"));
+      if (snap.exists() && snap.data().url) {
+        $("shuttle-link").href = snap.data().url;
+      } else {
+        $("shuttle-link").style.display = "none";
+      }
+    } catch {
+      $("shuttle-link").style.display = "none";
+    }
+  }
+
+  async function loadOutletsAndBoulders() {
+    // Outlets and boulders are read once at login — they don't change
+    // mid-event. Completions (what's "done") stay live via onSnapshot below.
+    const outletsSnap = await getDoc(doc(db, "config", "outlets"));
+    outlets = outletsSnap.exists() ? (outletsSnap.data().list || []) : [];
+
+    const bouldersSnap = await getDoc(doc(db, "config", "boulders"));
+    boulders = bouldersSnap.exists() ? (bouldersSnap.data().list || []) : [];
+
+    renderOutletTabs();
+    if (outlets.length) {
+      activeOutletId = outlets[0].id;
+      selectOutlet(activeOutletId);
+    }
+
+    listenToCompletions();
+  }
+
+  function listenToCompletions() {
+    const q = query(
+      collection(db, "boulderCompletions"),
+      where("groupId", "==", currentGroupId)
+    );
+    onSnapshot(q, (snap) => {
+      completedBoulderIds = new Set(snap.docs.map(d => d.data().boulderId));
+      renderBoulderList();
+    });
+  }
+
+  function renderOutletTabs() {
+    const wrap = $("outlet-tabs");
+    wrap.innerHTML = "";
+    outlets.forEach((o) => {
+      const tab = document.createElement("div");
+      tab.className = "outlet-tab" + (o.id === activeOutletId ? " active" : "");
+      tab.textContent = o.name;
+      tab.addEventListener("click", () => selectOutlet(o.id));
+      wrap.appendChild(tab);
+    });
+  }
+
+  function selectOutlet(outletId) {
+    activeOutletId = outletId;
+    renderOutletTabs();
+    renderBoulderList();
+  }
+
+  function renderBoulderList() {
+    const list = $("boulder-list");
+    list.innerHTML = "";
+
+    const items = boulders.filter(b => b.outletId === activeOutletId);
+
+    if (!items.length) {
+      list.innerHTML = `<div class="empty-state">No boulders listed for this outlet yet.</div>`;
+      return;
+    }
+
+    items.forEach((b) => {
+      const done = completedBoulderIds.has(b.id);
+      const card = document.createElement("div");
+      card.className = "boulder-card" + (done ? " done" : "");
+      card.innerHTML = `
+        <div class="boulder-info">
+          <div class="name">${escapeHtml(b.name)}</div>
+          <div class="points">${b.points} pts</div>
+        </div>
+      `;
+      const btn = document.createElement("button");
+      if (done) {
+        btn.className = "boulder-action logged";
+        btn.textContent = "✓ Logged";
+        btn.disabled = true;
+      } else {
+        btn.className = "boulder-action log";
+        btn.textContent = "Log it";
+        btn.addEventListener("click", () => logCompletion(b));
+      }
+      card.appendChild(btn);
+      list.appendChild(card);
+    });
+  }
+
+  async function logCompletion(boulder) {
+    // Optimistic UI: mark it done locally right away so taps feel
+    // instant even on slow wifi. Firestore offline persistence queues
+    // the write if there's no connection and syncs later.
+    completedBoulderIds.add(boulder.id);
+    renderBoulderList();
+    showToast(`${boulder.name} logged — +${boulder.points} pts`);
+
+    try {
+      await addDoc(collection(db, "boulderCompletions"), {
+        groupId: currentGroupId,
+        outletId: boulder.outletId,
+        boulderId: boulder.id,
+        points: boulder.points,
+        timestamp: serverTimestamp()
+      });
+      // NOTE: group.totalScore is NOT updated here client-side.
+      // A Cloud Function trigger on boulderCompletions/create recomputes
+      // the group's total server-side. Doing the sum server-side is what
+      // keeps this safe against a participant tampering with points in
+      // devtools — the client can log a completion, but only the server
+      // decides what it's worth.
+    } catch (e) {
+      console.error("Failed to log completion:", e);
+      showToast("Couldn't save — will retry when back online");
+      // We deliberately do NOT roll back completedBoulderIds here:
+      // Firestore's offline queue will retry the write automatically,
+      // and the onSnapshot listener will reconcile state once it lands.
+    }
+  }
+
+  function escapeHtml(str) {
+    const d = document.createElement("div");
+    d.textContent = str;
+    return d.innerHTML;
+  }
+
+  // Resume session if PIN was saved (convenience, not security —
+  // Firestore rules still gate what this PIN can actually write)
+  const savedPin = localStorage.getItem("groupPin");
+  if (savedPin) {
+    $("pin-input").value = savedPin;
+    handleLogin();
+  }
+</script>
+
+</body>
+</html>
